@@ -7,6 +7,7 @@ import * as Method from '../../Method.js'
 import * as Account from '../../viem/Account.js'
 import * as Client from '../../viem/Client.js'
 import * as z from '../../zod.js'
+import { getAccountSignerAddress } from '../internal/account.js'
 import * as defaults from '../internal/defaults.js'
 import * as Methods from '../Methods.js'
 import type { SessionCredentialPayload } from '../session/Types.js'
@@ -27,7 +28,6 @@ export const sessionContextSchema = z.object({
   cumulativeAmount: z.optional(z.amount()),
   cumulativeAmountRaw: z.optional(z.string()),
   transaction: z.optional(z.string()),
-  authorizedSigner: z.optional(z.string()),
   additionalDeposit: z.optional(z.amount()),
   additionalDepositRaw: z.optional(z.string()),
   depositRaw: z.optional(z.string()),
@@ -79,9 +79,6 @@ export function session(parameters: session.Parameters = {}) {
     rpcUrl: defaults.rpcUrl,
   })
   const getAccount = Account.getResolver({ account: parameters.account })
-  const getAuthorizedSigner = (account: viem_Account) =>
-    parameters.authorizedSigner ??
-    (account as unknown as { accessKeyAddress?: Address }).accessKeyAddress
 
   const maxDeposit =
     parameters.maxDeposit !== undefined ? parseUnits(parameters.maxDeposit, decimals) : undefined
@@ -141,7 +138,7 @@ export function session(parameters: session.Parameters = {}) {
       )
     })()
 
-    const authorizedSigner = getAuthorizedSigner(account)
+    const voucherSigner = parameters.voucherSigner ?? account
 
     const key = channelKey(payee, currency, escrowContract)
     let entry = channels.get(key)
@@ -186,12 +183,12 @@ export function session(parameters: session.Parameters = {}) {
         entry.cumulativeAmount,
         escrowContract,
         chainId,
-        authorizedSigner,
+        voucherSigner,
       )
       notifyUpdate(entry)
     } else {
       const result = await createOpenPayload(client, account, {
-        authorizedSigner,
+        voucherSigner,
         escrowContract,
         payee,
         currency,
@@ -222,12 +219,8 @@ export function session(parameters: session.Parameters = {}) {
     const client = await getClient({ chainId })
 
     const action = context.action!
-    const {
-      channelId: channelIdRaw,
-      transaction,
-      authorizedSigner: contextAuthorizedSigner,
-    } = context
-    const authorizedSigner = (contextAuthorizedSigner as Address) ?? getAuthorizedSigner(account)
+    const { channelId: channelIdRaw, transaction } = context
+    const voucherSigner = parameters.voucherSigner ?? account
     const channelId = channelIdRaw as Hex.Hex
     const cumulativeAmount = context.cumulativeAmountRaw
       ? BigInt(context.cumulativeAmountRaw)
@@ -256,14 +249,14 @@ export function session(parameters: session.Parameters = {}) {
           { channelId, cumulativeAmount },
           escrowContract,
           chainId,
-          authorizedSigner,
+          voucherSigner,
         )
         payload = {
           action: 'open',
           type: 'transaction',
           channelId,
           transaction: transaction as Hex.Hex,
-          authorizedSigner: authorizedSigner ?? account.address,
+          authorizedSigner: getAccountSignerAddress(voucherSigner),
           cumulativeAmount: cumulativeAmount.toString(),
           signature,
         }
@@ -293,7 +286,7 @@ export function session(parameters: session.Parameters = {}) {
           cumulativeAmount,
           escrowContract,
           chainId,
-          authorizedSigner,
+          voucherSigner,
         )
         const key = channelIdToKey.get(channelId)
         if (key) {
@@ -316,7 +309,7 @@ export function session(parameters: session.Parameters = {}) {
           { channelId, cumulativeAmount },
           escrowContract,
           chainId,
-          authorizedSigner,
+          voucherSigner,
         )
         payload = {
           action: 'close',
@@ -364,8 +357,8 @@ export function session(parameters: session.Parameters = {}) {
 export declare namespace session {
   type Parameters = Account.getResolver.Parameters &
     Client.getResolver.Parameters & {
-      /** Address authorized to sign vouchers. Defaults to the account address. Use when a separate access key (e.g. secp256k1) signs vouchers while the root account funds the channel. */
-      authorizedSigner?: Address | undefined
+      /** Account that signs voucher digests. Defaults to `account`; access-key accounts sign raw vouchers as their access-key address. */
+      voucherSigner?: viem_Account | undefined
       /** Token decimals for parsing human-readable amounts (default: 6). */
       decimals?: number | undefined
       /** Initial deposit amount in human-readable units (e.g. "10" for 10 tokens). When set, the method handles the full channel lifecycle (open, voucher, cumulative tracking) automatically. */

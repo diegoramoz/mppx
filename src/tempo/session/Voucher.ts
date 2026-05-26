@@ -1,10 +1,10 @@
-import { type Address, Signature } from 'ox'
+import { Signature, type Address } from 'ox'
 import { SignatureEnvelope } from 'ox/tempo'
 import type { Account, Client, Hex } from 'viem'
-import { recoverTypedDataAddress } from 'viem'
+import { hashTypedData } from 'viem'
 import { signTypedData } from 'viem/actions'
 
-import * as TempoAddress from '../internal/address.js'
+import { getAccountSignerAddress, isAccessKeyAccount } from '../internal/account.js'
 import type { SignedVoucher, Voucher } from './Types.js'
 
 /** Must match the on-chain TempoStreamChannel DOMAIN_SEPARATOR name. */
@@ -35,6 +35,71 @@ const voucherTypes = {
   ],
 } as const
 
+const acceptTip1020VoucherSignatures = false
+
+function getVoucherMessage(message: Voucher) {
+  return {
+    channelId: message.channelId,
+    cumulativeAmount: message.cumulativeAmount,
+  }
+}
+
+function getVoucherDigest(escrowContract: Address.Address, chainId: number, message: Voucher) {
+  return hashTypedData({
+    domain: getVoucherDomain(escrowContract, chainId),
+    types: voucherTypes,
+    primaryType: 'Voucher',
+    message: getVoucherMessage(message),
+  })
+}
+
+async function signVoucherTypedData(
+  client: Client,
+  account: Account,
+  message: Voucher,
+  escrowContract: Address.Address,
+  chainId: number,
+): Promise<Hex> {
+  return signTypedData(client, {
+    account,
+    domain: getVoucherDomain(escrowContract, chainId),
+    types: voucherTypes,
+    primaryType: 'Voucher',
+    message: getVoucherMessage(message),
+  })
+}
+
+function normalizeVoucherSignature(signature: Hex): Hex {
+  const envelope = SignatureEnvelope.from(signature as SignatureEnvelope.Serialized)
+
+  if (envelope.type === 'keychain') {
+    if (envelope.inner.type !== 'secp256k1')
+      throw new Error(
+        'Session vouchers only unwrap secp256k1 keychain signatures; pass a direct voucherSigner for other key types.',
+      )
+
+    return Signature.toHex(envelope.inner.signature)
+  }
+
+  // Tempo local accounts may append signature-envelope magic bytes for RPC
+  // routing. Voucher signatures are direct envelopes without magic bytes.
+  return SignatureEnvelope.serialize(envelope)
+}
+
+function acceptsVoucherEnvelope(envelope: SignatureEnvelope.SignatureEnvelope): boolean {
+  if (envelope.type === 'keychain') return false
+  if (envelope.type === 'secp256k1') return true
+  return acceptTip1020VoucherSignatures
+}
+
+function assertSupportedVoucherEnvelope(envelope: SignatureEnvelope.SignatureEnvelope) {
+  if (acceptsVoucherEnvelope(envelope)) return
+
+  throw new Error(
+    'Session vouchers only support secp256k1 signatures until TIP-1020 voucher verification is enabled.',
+  )
+}
+
 /**
  * Sign a voucher with an account.
  */
@@ -44,39 +109,36 @@ export async function signVoucher(
   message: Voucher,
   escrowContract: Address.Address,
   chainId: number,
-  authorizedSigner?: Address.Address | undefined,
+  voucherSigner?: Account | undefined,
 ): Promise<Hex> {
-  const signature = await signTypedData(client, {
-    account,
-    domain: getVoucherDomain(escrowContract, chainId),
-    types: voucherTypes,
-    primaryType: 'Voucher',
-    message: {
-      channelId: message.channelId,
-      cumulativeAmount: message.cumulativeAmount,
-    },
-  })
+  const signer = voucherSigner ?? account
+  const expectedSigner = getAccountSignerAddress(signer)
 
-  // When a separate authorizedSigner is used (e.g. access key), unwrap the
-  // keychain envelope — the escrow contract verifies raw ECDSA signatures
-  // against authorizedSigner, not keychain-wrapped ones.
-  // TODO: when TIP-1020 is implemented, we can remove this.
-  if (authorizedSigner) {
-    try {
-      const envelope = SignatureEnvelope.from(signature as SignatureEnvelope.Serialized)
-      if (envelope.type === 'keychain' && envelope.inner.type === 'secp256k1')
-        return Signature.toHex(envelope.inner.signature)
-    } catch {}
-  }
+  const digest = getVoucherDigest(escrowContract, chainId, message)
+  const signature = isAccessKeyAccount(signer)
+    ? await signer.sign({ hash: digest, raw: true })
+    : await signVoucherTypedData(client, signer, message, escrowContract, chainId)
+  const normalized = normalizeVoucherSignature(signature)
+  const envelope = SignatureEnvelope.from(normalized as SignatureEnvelope.Serialized)
+  assertSupportedVoucherEnvelope(envelope)
 
-  return signature
+  if (
+    !SignatureEnvelope.verify(envelope, {
+      address: expectedSigner,
+      payload: digest,
+    })
+  )
+    throw new Error('voucher signature does not match voucher signer')
+
+  return normalized
 }
 
 /**
  * Verify a voucher signature matches the expected signer.
  *
- * Only accepts raw secp256k1 signatures — the escrow contract verifies
- * via ecrecover. Keychain, p256, and webAuthn signatures are rejected.
+ * Accepts canonical raw secp256k1 voucher signatures.
+ *
+ * TIP-1020 voucher signatures will be enabled when onchain escrow verification ships.
  */
 export async function verifyVoucher(
   escrowContract: Address.Address,
@@ -85,31 +147,17 @@ export async function verifyVoucher(
   expectedSigner: Address.Address,
 ): Promise<boolean> {
   try {
-    const domain = getVoucherDomain(escrowContract, chainId)
-    const message = {
-      channelId: voucher.channelId,
-      cumulativeAmount: voucher.cumulativeAmount,
-    }
-
     const envelope = SignatureEnvelope.from(voucher.signature)
 
-    // Reject keychain signatures — the escrow contract verifies raw ECDSA
-    // signatures against authorizedSigner, not keychain-wrapped ones.
-    if (envelope.type === 'keychain') return false
+    if (!acceptsVoucherEnvelope(envelope)) return false
 
-    // Reject non-secp256k1 signatures (p256, webAuthn) — the escrow contract
-    // only supports ecrecover-based verification.
-    // TODO: remove this once TIP-1020 is implemented
-    if (envelope.type !== 'secp256k1') return false
+    const canonical = SignatureEnvelope.serialize(envelope)
+    if (canonical.toLowerCase() !== voucher.signature.toLowerCase()) return false
 
-    const signer = await recoverTypedDataAddress({
-      domain,
-      types: voucherTypes,
-      primaryType: 'Voucher',
-      message,
-      signature: voucher.signature,
+    return SignatureEnvelope.verify(envelope, {
+      address: expectedSigner,
+      payload: getVoucherDigest(escrowContract, chainId, voucher),
     })
-    return TempoAddress.isEqual(signer, expectedSigner)
   } catch {
     return false
   }
